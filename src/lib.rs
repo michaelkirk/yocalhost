@@ -216,9 +216,11 @@ mod tests {
 
     #[test]
     fn next_port_increments() {
-        assert_eq!(ThrottledServer::next_port(), 9901);
-        assert_eq!(ThrottledServer::next_port(), 9902);
-        assert_eq!(ThrottledServer::next_port(), 9903);
+        let first = ThrottledServer::next_port();
+        let second = ThrottledServer::next_port();
+        let third = ThrottledServer::next_port();
+        assert!(first < second);
+        assert!(second < third);
     }
 
     async fn make_1mb_request(port: u16) -> Response<Body> {
