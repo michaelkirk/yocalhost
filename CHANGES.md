@@ -1,6 +1,6 @@
 # Changelog
 
-## UNRELEASED - released 2023.xx.xx
+## 0.2.0 - released 2023.09.06
 
 - Rate limits are enforced across concurrent requests.
 
