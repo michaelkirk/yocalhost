@@ -24,19 +24,19 @@ pub type Error = Box<dyn std::error::Error>;
 async fn handle(
     req: Request<Body>,
     latency: Duration,
-    bytes_per_second: usize,
+    limiter: Limiter,
     static_files: Static,
 ) -> Result<Response<Body>, hyper::Error> {
     // simulate latency
     // REVIEW: should we use Delay?
     sleep(latency).await;
-    throttled_download(req, bytes_per_second, static_files).await
+    throttled_download(req, limiter, static_files).await
     // throttled_proxy(req, bandwidth).await
 }
 
 async fn throttled_response(
     mut response: Response<Body>,
-    bytes_per_second: usize,
+    limiter: Limiter,
 ) -> Result<Response<Body>, hyper::Error> {
     let mut response_body = Body::empty();
     std::mem::swap(&mut response_body, response.body_mut());
@@ -44,9 +44,6 @@ async fn throttled_response(
     let (mut sender, body) = hyper::body::Body::channel();
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
-
-        // simulate bandwidth
-        let limiter = <Limiter>::new(bytes_per_second as f64);
 
         while let Some(chunk) = response_body.next().await {
             let buffer_1 = chunk.unwrap().to_vec();
@@ -70,20 +67,20 @@ async fn throttled_response(
 
 async fn throttled_download(
     req: Request<Body>,
-    bytes_per_second: usize,
+    limiter: Limiter,
     static_files: Static,
 ) -> Result<Response<Body>, hyper::Error> {
     let response = static_files
         .serve(req)
         .await
         .expect("TODO: handle error conversion");
-    throttled_response(response, bytes_per_second).await
+    throttled_response(response, limiter).await
 }
 
 #[allow(unused)]
 async fn throttled_proxy(
     mut req: Request<Body>,
-    bytes_per_second: usize,
+    limiter: Limiter,
 ) -> Result<Response<Body>, hyper::Error> {
     let uri = req.uri().clone();
     let mut parts = uri.into_parts();
@@ -95,7 +92,7 @@ async fn throttled_proxy(
     *req.uri_mut() = uri;
     let client = Client::new();
     let response = client.request(req).await?;
-    throttled_response(response, bytes_per_second).await
+    throttled_response(response, limiter).await
 }
 
 #[derive(Clone, Debug)]
@@ -140,14 +137,24 @@ impl ThrottledServer {
 
     pub async fn serve(self) {
         let latency = self.latency;
-        let bytes_per_second = self.bytes_per_second;
         let web_root = self.web_root.clone();
 
+        let bytes_per_second = self.bytes_per_second;
+        // simulate bandwidth
+        //
+        // Limiter is created at the outer level and cloned in so that all connections have a
+        // single shared limit, otherwise clients could get around the limit by making concurrent
+        // requests.
+        //
+        // If you need to enforce separate limits, start a new server instance on a new port.
+        let limiter = <Limiter>::new(bytes_per_second as f64);
+
         let make_service = make_service_fn(move |_socket| {
+            let limiter = limiter.clone();
             let static_files = Static::new(web_root.clone());
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
-                    handle(req, latency, bytes_per_second, static_files.clone())
+                    handle(req, latency, limiter.clone(), static_files.clone())
                 }))
             }
         });
@@ -232,6 +239,26 @@ mod tests {
         client.request(request).await.unwrap()
     }
 
+    /// ```
+    /// let actual = Duration::from_millis(97);
+    /// let expected = Duration::from_millis(100);
+    /// let tolerance = Duration::from_millis(4);
+    ///
+    /// assert_near!(actual, expected, tolerance);
+    /// ```
+    macro_rules! assert_near {
+        ($actual:expr, $expected:expr, $tolerance:expr) => {
+            let range = ($actual - $tolerance..$actual + $tolerance);
+            assert!(
+                range.contains(&$expected),
+                "{actual:?} not within {tolerance:?} of {expected:?}",
+                actual = $actual,
+                tolerance = $tolerance,
+                expected = $expected
+            );
+        };
+    }
+
     #[tokio::test]
     async fn starts() {
         let server =
@@ -260,33 +287,23 @@ mod tests {
     async fn latency() {
         {
             let latency = Duration::from_millis(50);
-            let server = ThrottledServer::test(latency, Byte::from_str("1 Mb").unwrap());
+            let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
             let now = Instant::now();
             make_1mb_request(server.port).await;
             let elapsed = now.elapsed();
-            dbg!(elapsed);
-            assert!(elapsed > latency, "request took less than {latency:?}");
-            assert!(
-                elapsed < 2 * latency,
-                "request took longer than 2x{latency:?}"
-            );
+            assert_near!(elapsed, latency, Duration::from_millis(10));
         }
         {
             let latency = Duration::from_millis(100);
-            let server = ThrottledServer::test(latency, Byte::from_str("1 Mb").unwrap());
+            let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
             let now = Instant::now();
             make_1mb_request(server.port).await;
             let elapsed = now.elapsed();
-            dbg!(elapsed);
-            assert!(elapsed > latency, "request took less than {latency:?}");
-            assert!(
-                elapsed < 2 * latency,
-                "request took longer than 2x{latency:?}"
-            );
+            assert_near!(elapsed, latency, Duration::from_millis(10));
         }
     }
 
@@ -302,13 +319,17 @@ mod tests {
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
-        assert!(elapsed < Duration::from_millis(100));
+        assert_near!(
+            elapsed,
+            Duration::from_millis(11),
+            Duration::from_millis(10)
+        );
     }
 
     #[tokio::test]
     async fn low_bandwidth_should_complete_slowly() {
         let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_str("0.75Mb").unwrap());
+        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
         server.spawn_in_background().await.unwrap();
 
         let now = Instant::now();
@@ -317,8 +338,31 @@ mod tests {
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
-        assert!(elapsed > Duration::from_millis(1000));
-        assert!(elapsed < Duration::from_millis(1500));
+
+        let expected = Duration::from_millis(2000);
+        let tolerance = Duration::from_millis(500);
+        assert_near!(elapsed, expected, tolerance);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_should_share_bandwidth() {
+        let latency = Duration::from_millis(1);
+        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
+        server.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let (response_1, response_2) =
+            tokio::join!(make_1mb_request(server.port), make_1mb_request(server.port));
+
+        let bytes_1 = hyper::body::to_bytes(response_1.into_body()).await.unwrap();
+        assert_eq!(bytes_1.len(), 1_000_000);
+        let bytes_2 = hyper::body::to_bytes(response_2.into_body()).await.unwrap();
+        assert_eq!(bytes_2.len(), 1_000_000);
+
+        let elapsed = now.elapsed();
+        let expected = Duration::from_millis(4000);
+        let tolerance = Duration::from_millis(500);
+        assert_near!(elapsed, expected, tolerance);
     }
 
     #[tokio::test]
