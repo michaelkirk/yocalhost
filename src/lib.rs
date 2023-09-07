@@ -239,6 +239,26 @@ mod tests {
         client.request(request).await.unwrap()
     }
 
+    /// ```
+    /// let actual = Duration::from_millis(97);
+    /// let expected = Duration::from_millis(100);
+    /// let tolerance = Duration::from_millis(4);
+    ///
+    /// assert_near!(actual, expected, tolerance);
+    /// ```
+    macro_rules! assert_near {
+        ($actual:expr, $expected:expr, $tolerance:expr) => {
+            let range = ($actual - $tolerance..$actual + $tolerance);
+            assert!(
+                range.contains(&$expected),
+                "{actual:?} not within {tolerance:?} of {expected:?}",
+                actual = $actual,
+                tolerance = $tolerance,
+                expected = $expected
+            );
+        };
+    }
+
     #[tokio::test]
     async fn starts() {
         let server =
@@ -267,33 +287,23 @@ mod tests {
     async fn latency() {
         {
             let latency = Duration::from_millis(50);
-            let server = ThrottledServer::test(latency, Byte::from_str("1 Mb").unwrap());
+            let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
             let now = Instant::now();
             make_1mb_request(server.port).await;
             let elapsed = now.elapsed();
-            dbg!(elapsed);
-            assert!(elapsed > latency, "request took less than {latency:?}");
-            assert!(
-                elapsed < 2 * latency,
-                "request took longer than 2x{latency:?}"
-            );
+            assert_near!(elapsed, latency, Duration::from_millis(10));
         }
         {
             let latency = Duration::from_millis(100);
-            let server = ThrottledServer::test(latency, Byte::from_str("1 Mb").unwrap());
+            let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
             let now = Instant::now();
             make_1mb_request(server.port).await;
             let elapsed = now.elapsed();
-            dbg!(elapsed);
-            assert!(elapsed > latency, "request took less than {latency:?}");
-            assert!(
-                elapsed < 2 * latency,
-                "request took longer than 2x{latency:?}"
-            );
+            assert_near!(elapsed, latency, Duration::from_millis(10));
         }
     }
 
@@ -309,7 +319,11 @@ mod tests {
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
-        assert!(elapsed < Duration::from_millis(100));
+        assert_near!(
+            elapsed,
+            Duration::from_millis(11),
+            Duration::from_millis(10)
+        );
     }
 
     #[tokio::test]
@@ -326,15 +340,8 @@ mod tests {
         let elapsed = now.elapsed();
 
         let expected = Duration::from_millis(2000);
-        assert!(
-            elapsed > expected,
-            "{elapsed:?} was faster than the expected {expected:?}"
-        );
         let tolerance = Duration::from_millis(500);
-        assert!(
-            elapsed < expected + tolerance,
-            "{elapsed:?} not within {tolerance:?} of {expected:?}"
-        );
+        assert_near!(elapsed, expected, tolerance);
     }
 
     #[tokio::test]
@@ -353,17 +360,9 @@ mod tests {
         assert_eq!(bytes_2.len(), 1_000_000);
 
         let elapsed = now.elapsed();
-
         let expected = Duration::from_millis(4000);
-        assert!(
-            elapsed > expected,
-            "{elapsed:?} was faster than the expected {expected:?}"
-        );
         let tolerance = Duration::from_millis(500);
-        assert!(
-            elapsed < expected + tolerance,
-            "{elapsed:?} not within {tolerance:?} of {expected:?}"
-        );
+        assert_near!(elapsed, expected, tolerance);
     }
 
     #[tokio::test]
