@@ -17,26 +17,57 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[macro_use]
+extern crate log;
+
 pub type Error = Box<dyn std::error::Error>;
+
+mod stats {
+    #[derive(Debug, Default)]
+    pub(crate) struct Response {
+        pub len: usize,
+    }
+
+    #[derive(Debug, Default)]
+    pub(crate) struct Stats {
+        pub responses: Vec<Response>,
+    }
+
+    impl Stats {
+        pub fn print_summary(&self) {
+            let req_count = self.responses.len();
+            let body_bytes_sent: usize = self.responses.iter().map(|r| r.len).sum();
+            debug!("req_count: {req_count}, body_bytes_sent: {body_bytes_sent}");
+        }
+
+        pub fn push_response(&mut self, response: Response) {
+            self.responses.push(response)
+        }
+    }
+}
+type Stats = Arc<Mutex<stats::Stats>>;
 
 async fn handle(
     req: Request<Body>,
     latency: Duration,
     limiter: Limiter,
     static_files: Static,
+    stats: Stats,
 ) -> Result<Response<Body>, hyper::Error> {
     // simulate latency
     // REVIEW: should we use Delay?
     sleep(latency).await;
-    throttled_download(req, limiter, static_files).await
+    throttled_download(req, limiter, static_files, stats).await
     // throttled_proxy(req, bandwidth).await
 }
 
 async fn throttled_response(
     mut response: Response<Body>,
     limiter: Limiter,
+    stats: Stats,
 ) -> Result<Response<Body>, hyper::Error> {
     let mut response_body = Body::empty();
     std::mem::swap(&mut response_body, response.body_mut());
@@ -45,8 +76,10 @@ async fn throttled_response(
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
 
+        let mut response = stats::Response::default();
         while let Some(chunk) = response_body.next().await {
             let buffer_1 = chunk.unwrap().to_vec();
+            response.len += buffer_1.len();
             let mut limited_buffer = limiter.clone().limit(Cursor::new(&buffer_1));
             let mut buffer_2 = vec![];
 
@@ -59,6 +92,11 @@ async fn throttled_response(
             // output?
             sender.send_data(back_out_again).await.unwrap();
         }
+        let mut stats = stats.lock().unwrap();
+        if cfg!(feature = "stats") {
+            stats.push_response(response);
+            stats.print_summary()
+        }
     });
 
     *response.body_mut() = body;
@@ -69,18 +107,20 @@ async fn throttled_download(
     req: Request<Body>,
     limiter: Limiter,
     static_files: Static,
+    stats: Stats,
 ) -> Result<Response<Body>, hyper::Error> {
     let response = static_files
         .serve(req)
         .await
         .expect("TODO: handle error conversion");
-    throttled_response(response, limiter).await
+    throttled_response(response, limiter, stats).await
 }
 
 #[allow(unused)]
 async fn throttled_proxy(
     mut req: Request<Body>,
     limiter: Limiter,
+    stats: Stats,
 ) -> Result<Response<Body>, hyper::Error> {
     let uri = req.uri().clone();
     let mut parts = uri.into_parts();
@@ -92,7 +132,7 @@ async fn throttled_proxy(
     *req.uri_mut() = uri;
     let client = Client::new();
     let response = client.request(req).await?;
-    throttled_response(response, limiter).await
+    throttled_response(response, limiter, stats).await
 }
 
 #[derive(Clone, Debug)]
@@ -148,13 +188,21 @@ impl ThrottledServer {
         //
         // If you need to enforce separate limits, start a new server instance on a new port.
         let limiter = <Limiter>::new(bytes_per_second as f64);
+        let stats = Arc::new(Mutex::new(stats::Stats::default()));
 
         let make_service = make_service_fn(move |_socket| {
             let limiter = limiter.clone();
             let static_files = Static::new(web_root.clone());
+            let stats = stats.clone();
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
-                    handle(req, latency, limiter.clone(), static_files.clone())
+                    handle(
+                        req,
+                        latency,
+                        limiter.clone(),
+                        static_files.clone(),
+                        stats.clone(),
+                    )
                 }))
             }
         });
@@ -162,9 +210,9 @@ impl ThrottledServer {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         let server = HyperServer::bind(&addr).serve(make_service);
 
-        println!("Listening...");
+        println!("Listening on {addr:?}...");
         if let Err(e) = server.await {
-            println!("error: {}", e);
+            error!("error: {}", e);
         }
     }
 
@@ -188,11 +236,11 @@ impl ThrottledServer {
 
             loop {
                 if ping_server(port).await {
-                    println!("ping succeeded");
+                    debug!("ping succeeded");
                     tx.send(()).unwrap();
                     break;
                 } else {
-                    println!("ping failed");
+                    debug!("ping failed");
                 }
                 sleep(Duration::from_micros(100)).await;
             }
@@ -202,7 +250,7 @@ impl ThrottledServer {
             .await
             .expect("startup timed out");
 
-        println!("finished starting");
+        debug!("finished starting");
         Ok(())
     }
 

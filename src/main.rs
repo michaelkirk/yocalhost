@@ -27,6 +27,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "env_logger")]
+    {
+        env_logger::init();
+    }
     let args = Args::parse();
     dbg!(&args);
 
