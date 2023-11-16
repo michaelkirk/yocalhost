@@ -15,7 +15,7 @@ use tokio::time::{sleep, timeout};
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -135,6 +135,18 @@ async fn throttled_proxy(
     throttled_response(response, limiter, stats).await
 }
 
+/// An HTTP server that imposes artificial latency and bandwidth limits.
+///
+/// ```no_run
+/// use yocalhost::ThrottledServer;
+/// use std::time::Duration;
+/// # async fn start() {
+/// let server = ThrottledServer::new(8845, Duration::from_millis(100), 1_000_000, "path/to/test-fixtures");
+/// server.spawn_in_background().await.expect("proper startup");
+/// # }
+///
+/// // now you can make your requests against http://localhost:9999
+/// ```
 #[derive(Clone, Debug)]
 pub struct ThrottledServer {
     port: u16,
@@ -167,6 +179,14 @@ impl ThrottledServer {
             bytes_per_second,
             web_root: web_root.into(),
         }
+    }
+
+    pub fn web_root(&self) -> &Path {
+        &self.web_root
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub async fn spawn_in_background(&self) -> Result<(), Error> {
