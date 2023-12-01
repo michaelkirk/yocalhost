@@ -322,7 +322,7 @@ mod tests {
     /// ```
     macro_rules! assert_near {
         ($actual:expr, $expected:expr, $tolerance:expr) => {
-            let range = ($actual - $tolerance..$actual + $tolerance);
+            let range = ($actual.max($tolerance) - $tolerance..$actual + $tolerance);
             assert!(
                 range.contains(&$expected),
                 "{actual:?} not within {tolerance:?} of {expected:?}",
