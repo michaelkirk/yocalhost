@@ -5,6 +5,7 @@ edition = "2021"
 description = "an http development server that simulates latency and bandwidth limitations"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michaelkirk/yocalhost"
+exclude = ["test_data/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
