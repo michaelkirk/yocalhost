@@ -90,7 +90,13 @@ async fn throttled_response(
             // Theres an error occuring during tests here, it doesn't seem to interfere
             // with the tests. Maybe we need a more judicious shutdown to avoid the spurious
             // output?
-            sender.send_data(back_out_again).await.unwrap();
+            match sender.send_data(back_out_again).await {
+                Ok(()) => (),
+                // This case often happens when client disconnects after a successful request.
+                // It'd be nice to ensure all data had been sent, but I'm not sure.
+                Err(hyper_error) if hyper_error.is_closed() => break,
+                Err(other) => panic!("err: {other}"),
+            }
         }
         let mut stats = stats.lock().unwrap();
         if cfg!(feature = "stats") {
@@ -316,7 +322,7 @@ mod tests {
     /// ```
     macro_rules! assert_near {
         ($actual:expr, $expected:expr, $tolerance:expr) => {
-            let range = ($actual - $tolerance..$actual + $tolerance);
+            let range = ($actual.max($tolerance) - $tolerance..$actual + $tolerance);
             assert!(
                 range.contains(&$expected),
                 "{actual:?} not within {tolerance:?} of {expected:?}",
