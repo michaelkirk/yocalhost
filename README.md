@@ -1,6 +1,22 @@
 ## localhost too fast? try yocalhost.
 
-yocalhost is an http development server that simulates latency and bandwidth limitations. It supports Range requests, and will throttle bandwidth across all concurrent connections.
+yocalhost is an http development server that simulates latency and bandwidth limitations. 
+
+It supports Range requests, and will throttle bandwidth across all concurrent connections.
+
+### Motivation
+
+Evaluating against a naive localhost server, where latency and bandwidth are
+unrealistitcally fast, does little to tell you how your network access will
+perform in the real world.
+
+Evaluating a network client against a remote host is subject to the whim of the
+rest of the internet. Especially if your client involves many requests, it can
+be hard to get consistent measurements.
+
+With yocalhost, you run a local http server, but specify artificial bandwidth
+and latency limitations. This allows you to measure realistic(ish) implications
+of latency and bandwidth on your code in a reproducible way.
 
 ### Installing the yocalhost development server CLI
 
@@ -47,16 +63,3 @@ c.bench_function("my network test", |b| {
 })
 
 ```
-
-### Motivation
-
-Evaluating a network client against a remote host is subject to the whim of the
-rest of the internet. Especially if your client involves many requests, it can
-be hard to get consistent measurements.
-
-Evaluating against a naive localhost server, where latency and bandwidth are
-unreasonably fast, can draw a false picture.
-
-With yocalhost, you run a local http server, but specify artificial bandwidth
-and latency limitations. This allows you to measure realistic(ish) implications
-of latency and bandwidth on your code in a reproducible way.
