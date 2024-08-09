@@ -157,7 +157,7 @@ async fn throttled_proxy(
 pub struct ThrottledServer {
     port: u16,
     latency: Duration,
-    bytes_per_second: usize,
+    bytes_per_second: u64,
     web_root: PathBuf,
 }
 
@@ -168,15 +168,15 @@ impl ThrottledServer {
         Self::new(
             Self::next_port(),
             latency,
-            bandwidth.get_bytes() as usize,
-            &PathBuf::from(web_root),
+            bandwidth.as_u64(),
+            PathBuf::from(web_root),
         )
     }
 
     pub fn new(
         port: u16,
         latency: Duration,
-        bytes_per_second: usize,
+        bytes_per_second: u64,
         web_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
@@ -293,6 +293,7 @@ impl ThrottledServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body::HttpBody;
     use std::time::Instant;
 
     #[test]
@@ -389,7 +390,7 @@ mod tests {
 
         let now = Instant::now();
         let response = make_1mb_request(server.port).await;
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
@@ -403,12 +404,12 @@ mod tests {
     #[tokio::test]
     async fn low_bandwidth_should_complete_slowly() {
         let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
+        let server = ThrottledServer::test(latency, Byte::from_u64(500_000));
         server.spawn_in_background().await.unwrap();
 
         let now = Instant::now();
         let response = make_1mb_request(server.port).await;
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
@@ -421,16 +422,16 @@ mod tests {
     #[tokio::test]
     async fn concurrent_requests_should_share_bandwidth() {
         let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
+        let server = ThrottledServer::test(latency, Byte::from_u64(500_000));
         server.spawn_in_background().await.unwrap();
 
         let now = Instant::now();
         let (response_1, response_2) =
             tokio::join!(make_1mb_request(server.port), make_1mb_request(server.port));
 
-        let bytes_1 = hyper::body::to_bytes(response_1.into_body()).await.unwrap();
+        let bytes_1 = response_1.collect().await.unwrap().to_bytes();
         assert_eq!(bytes_1.len(), 1_000_000);
-        let bytes_2 = hyper::body::to_bytes(response_2.into_body()).await.unwrap();
+        let bytes_2 = response_2.collect().await.unwrap().to_bytes();
         assert_eq!(bytes_2.len(), 1_000_000);
 
         let elapsed = now.elapsed();
@@ -453,7 +454,7 @@ mod tests {
             .body(Body::empty())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 9);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "A Project");
@@ -464,7 +465,7 @@ mod tests {
             .body(Body::empty())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 19);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "I lived at West Egg");
@@ -475,7 +476,7 @@ mod tests {
             .body(Body::empty())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 8);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "West Egg");

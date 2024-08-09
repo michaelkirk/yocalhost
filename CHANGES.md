@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0 - released 2023.11.16
+
+- BREAKING: bandwidth is now u64, not usize
+
 ## 0.4.0 - released 2023.11.16
 
 - Expose getters for `ThrottledServer`'s `port` and `web_root`.
