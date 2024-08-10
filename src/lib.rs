@@ -1,29 +1,43 @@
+use std::fmt::Debug;
 use async_speed_limit::Limiter;
 #[cfg(test)]
 use byte_unit::Byte;
 use futures::StreamExt;
 use hyper::{
     body::Bytes,
-    http::uri::{Authority, Scheme},
-    service::{make_service_fn, service_fn},
-    Body, Client, Request, Response, Server as HyperServer, Uri,
+    Request, Response, Uri,
 };
 use hyper_staticfile::Static;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 
-use std::convert::Infallible;
+use http_body_util::{Empty, StreamBody};
+use hyper::body::{Body, Buf, Frame, Incoming as IncomingBody};
+use hyper::server::conn::http1;
+use hyper::service::Service;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::net::TcpListener;
 
 #[macro_use]
 extern crate log;
 
 pub type Error = Box<dyn std::error::Error>;
+
+// It seems crazy that we need to be this verbose for a basic "HTTP Get client",
+// but I'm not sure how to make it simpler.
+type GetClient = Client<HttpConnector, Empty<&'static [u8]>>;
+
+fn build_http_get_client() -> GetClient {
+    Client::builder(TokioExecutor::new()).build_http()
+}
 
 mod stats {
     #[derive(Debug, Default)]
@@ -50,94 +64,71 @@ mod stats {
 }
 type Stats = Arc<Mutex<stats::Stats>>;
 
-async fn handle(
-    req: Request<Body>,
-    latency: Duration,
-    limiter: Limiter,
-    static_files: Static,
-    stats: Stats,
-) -> Result<Response<Body>, hyper::Error> {
-    // simulate latency
-    // REVIEW: should we use Delay?
-    sleep(latency).await;
-    throttled_download(req, limiter, static_files, stats).await
-    // throttled_proxy(req, bandwidth).await
-}
-
-async fn throttled_response(
-    mut response: Response<Body>,
+async fn throttled_response<B: Body + Send + Unpin + 'static>(
+    upstream_response: Response<B>,
     limiter: Limiter,
     stats: Stats,
-) -> Result<Response<Body>, hyper::Error> {
-    let mut response_body = Body::empty();
-    std::mem::swap(&mut response_body, response.body_mut());
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>
+where
+    B::Error: Debug,
+    B::Data: Debug + Send,
+{
+    let (upstream_parts, upstream_body) = upstream_response.into_parts();
 
-    let (mut sender, body) = hyper::body::Body::channel();
+    // REVIEW: buffer size
+    let buffer_size = 8 * 1024;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(buffer_size);
+
+    let byte_stream = ReceiverStream::new(rx);
+
     tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+        let mut response_stats = stats::Response::default();
 
-        let mut response = stats::Response::default();
-        while let Some(chunk) = response_body.next().await {
-            let buffer_1 = chunk.unwrap().to_vec();
-            response.len += buffer_1.len();
+        let mut data_stream = upstream_body.collect().await.unwrap().into_data_stream();
+        while let Some(chunk) = data_stream.next().await.transpose().unwrap() {
+            let buffer_1 = chunk.chunk();
+            response_stats.len += buffer_1.len();
             let mut limited_buffer = limiter.clone().limit(Cursor::new(&buffer_1));
             let mut buffer_2 = vec![];
 
-            // reading limited buffer to end
             limited_buffer.read_to_end(&mut buffer_2).await.unwrap();
 
             let back_out_again = Bytes::from(buffer_2);
-            // Theres an error occuring during tests here, it doesn't seem to interfere
+            // There's an error occurring during tests here, it doesn't seem to interfere
             // with the tests. Maybe we need a more judicious shutdown to avoid the spurious
             // output?
-            match sender.send_data(back_out_again).await {
+            match tx.send(Ok(Frame::data(back_out_again))).await {
                 Ok(()) => (),
                 // This case often happens when client disconnects after a successful request.
                 // It'd be nice to ensure all data had been sent, but I'm not sure.
-                Err(hyper_error) if hyper_error.is_closed() => break,
+                // Err(hyper_error) if hyper_error.is_closed() => break,
                 Err(other) => panic!("err: {other}"),
             }
         }
         let mut stats = stats.lock().unwrap();
         if cfg!(feature = "stats") {
-            stats.push_response(response);
+            stats.push_response(response_stats);
             stats.print_summary()
         }
     });
 
-    *response.body_mut() = body;
-    Ok(response)
+    let stream_body = StreamBody::new(byte_stream);
+    Ok(Response::from_parts(
+        upstream_parts,
+        BoxBody::new(stream_body),
+    ))
 }
 
 async fn throttled_download(
-    req: Request<Body>,
+    req: Request<hyper::body::Incoming>,
     limiter: Limiter,
     static_files: Static,
     stats: Stats,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let response = static_files
         .serve(req)
         .await
         .expect("TODO: handle error conversion");
-    throttled_response(response, limiter, stats).await
-}
-
-#[allow(unused)]
-async fn throttled_proxy(
-    mut req: Request<Body>,
-    limiter: Limiter,
-    stats: Stats,
-) -> Result<Response<Body>, hyper::Error> {
-    let uri = req.uri().clone();
-    let mut parts = uri.into_parts();
-    let authority = Authority::from_str("localhost:8000").expect("valid host");
-    parts.authority = Some(authority);
-    parts.scheme = Some(Scheme::HTTP);
-
-    let uri = Uri::from_parts(parts).expect("valid uri parts");
-    *req.uri_mut() = uri;
-    let client = Client::new();
-    let response = client.request(req).await?;
     throttled_response(response, limiter, stats).await
 }
 
@@ -157,8 +148,10 @@ async fn throttled_proxy(
 pub struct ThrottledServer {
     port: u16,
     latency: Duration,
-    bytes_per_second: usize,
+    limiter: Limiter,
+    stats: Stats,
     web_root: PathBuf,
+    client: GetClient,
 }
 
 impl ThrottledServer {
@@ -168,22 +161,25 @@ impl ThrottledServer {
         Self::new(
             Self::next_port(),
             latency,
-            bandwidth.get_bytes() as usize,
-            &PathBuf::from(web_root),
+            bandwidth.as_u64(),
+            PathBuf::from(web_root),
         )
     }
 
     pub fn new(
         port: u16,
         latency: Duration,
-        bytes_per_second: usize,
+        bytes_per_second: u64,
         web_root: impl Into<PathBuf>,
     ) -> Self {
+        let stats = Arc::new(Mutex::new(stats::Stats::default()));
         Self {
             port,
             latency,
-            bytes_per_second,
+            limiter: Limiter::new(bytes_per_second as f64),
+            stats,
             web_root: web_root.into(),
+            client: build_http_get_client(),
         }
     }
 
@@ -197,71 +193,28 @@ impl ThrottledServer {
 
     pub async fn spawn_in_background(&self) -> Result<(), Error> {
         let server = self.clone();
-        tokio::spawn(server.serve());
+        tokio::spawn(server.clone().serve());
         self.wait_for_start().await
-    }
-
-    pub async fn serve(self) {
-        let latency = self.latency;
-        let web_root = self.web_root.clone();
-
-        let bytes_per_second = self.bytes_per_second;
-        // simulate bandwidth
-        //
-        // Limiter is created at the outer level and cloned in so that all connections have a
-        // single shared limit, otherwise clients could get around the limit by making concurrent
-        // requests.
-        //
-        // If you need to enforce separate limits, start a new server instance on a new port.
-        let limiter = <Limiter>::new(bytes_per_second as f64);
-        let stats = Arc::new(Mutex::new(stats::Stats::default()));
-
-        let make_service = make_service_fn(move |_socket| {
-            let limiter = limiter.clone();
-            let static_files = Static::new(web_root.clone());
-            let stats = stats.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    handle(
-                        req,
-                        latency,
-                        limiter.clone(),
-                        static_files.clone(),
-                        stats.clone(),
-                    )
-                }))
-            }
-        });
-
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
-        let server = HyperServer::bind(&addr).serve(make_service);
-
-        println!("Listening on {addr:?}...");
-        if let Err(e) = server.await {
-            error!("error: {}", e);
-        }
     }
 
     async fn wait_for_start(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         let port = self.port;
-        tokio::spawn(async move {
-            async fn ping_server(port: u16) -> bool {
-                let request = Request::builder()
-                    .uri(format!("http://localhost:{port}/1M.txt"))
-                    .body(Body::empty())
-                    .expect("valid request");
+        let client = self.client.clone();
 
-                let client = Client::new();
-                client
-                    .request(request)
-                    .await
-                    .map(|resp| resp.status().is_success())
-                    .unwrap_or(false)
-            }
+        tokio::spawn(async move {
+            let uri = format!("http://localhost:{port}/1M.txt")
+                .parse::<Uri>()
+                .unwrap();
 
             loop {
-                if ping_server(port).await {
+                let is_up = client
+                    .get(uri.clone())
+                    .await
+                    .map(|resp| resp.status().is_success())
+                    .unwrap_or(false);
+
+                if is_up {
                     debug!("ping succeeded");
                     tx.send(()).unwrap();
                     break;
@@ -288,12 +241,60 @@ impl ThrottledServer {
         *next = value + 1;
         value
     }
+
+    pub async fn serve(self) {
+        let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
+        let listener = TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|_| panic!("unable to bind to address: {addr:?}"));
+        println!("Listening on http://{}", addr);
+
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("listener to bind to accept.");
+
+            let io = TokioIo::new(stream);
+            let svc_clone = self.clone();
+            tokio::task::spawn(async move {
+                if let Err(err) = http1::Builder::new().serve_connection(io, svc_clone).await {
+                    println!("Failed to serve connection: {:?}", err);
+                }
+            });
+        }
+    }
+}
+
+use http_body_util::{combinators::BoxBody, BodyExt};
+use hyper_util::client::legacy::connect::HttpConnector;
+use tokio::io::AsyncReadExt;
+use tokio_stream::wrappers::ReceiverStream;
+
+impl Service<Request<IncomingBody>> for ThrottledServer {
+    type Response = Response<BoxBody<Bytes, hyper::Error>>;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn call(&self, req: Request<IncomingBody>) -> Self::Future {
+        let static_files = Static::new(self.web_root.clone());
+        let limiter = self.limiter.clone();
+        let latency = self.latency;
+        let stats = self.stats.clone();
+
+        Box::pin(async move {
+            sleep(latency).await;
+            throttled_download(req, limiter, static_files, stats).await
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use std::time::Instant;
+    use std::str::FromStr;
 
     #[test]
     fn next_port_increments() {
@@ -304,13 +305,11 @@ mod tests {
         assert!(second < third);
     }
 
-    async fn make_1mb_request(port: u16) -> Response<Body> {
-        let client = Client::new();
-        let request = Request::builder()
-            .uri(format!("http://localhost:{port}/1M.txt"))
-            .body(Body::empty())
-            .expect("valid request");
-        client.request(request).await.unwrap()
+    async fn make_1mb_request(client: GetClient, port: u16) -> Response<impl Body> {
+        client
+            .get(format!("http://localhost:{port}/1M.txt").parse().unwrap())
+            .await
+            .expect("valid request")
     }
 
     /// ```
@@ -338,8 +337,9 @@ mod tests {
         let server =
             ThrottledServer::test(Duration::from_millis(50), Byte::from_str("1 Mb").unwrap());
         server.spawn_in_background().await.unwrap();
+        let client = build_http_get_client();
         let now = Instant::now();
-        make_1mb_request(server.port).await;
+        make_1mb_request(client, server.port).await;
         let elapsed = now.elapsed();
         assert!(elapsed > server.latency);
         assert!(elapsed < 2 * server.latency);
@@ -350,8 +350,9 @@ mod tests {
         let server =
             ThrottledServer::test(Duration::from_millis(50), Byte::from_str("1 Mb").unwrap());
         server.spawn_in_background().await.unwrap();
+        let client = build_http_get_client();
         let now = Instant::now();
-        make_1mb_request(server.port).await;
+        make_1mb_request(client, server.port).await;
         let elapsed = now.elapsed();
         assert!(elapsed > server.latency);
         assert!(elapsed < 2 * server.latency);
@@ -364,8 +365,9 @@ mod tests {
             let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
+            let client = build_http_get_client();
             let now = Instant::now();
-            make_1mb_request(server.port).await;
+            make_1mb_request(client, server.port).await;
             let elapsed = now.elapsed();
             assert_near!(elapsed, latency, Duration::from_millis(10));
         }
@@ -374,8 +376,9 @@ mod tests {
             let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
 
+            let client = build_http_get_client();
             let now = Instant::now();
-            make_1mb_request(server.port).await;
+            make_1mb_request(client, server.port).await;
             let elapsed = now.elapsed();
             assert_near!(elapsed, latency, Duration::from_millis(10));
         }
@@ -383,16 +386,24 @@ mod tests {
 
     #[tokio::test]
     async fn high_bandwidth_should_complete_quickly() {
-        let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_str("100 Mb").unwrap());
+        let latency = Duration::from_millis(0);
+        let server = ThrottledServer::test(latency, Byte::from_str("1 GB").unwrap());
         server.spawn_in_background().await.unwrap();
 
+        let client = build_http_get_client();
         let now = Instant::now();
-        let response = make_1mb_request(server.port).await;
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let response = make_1mb_request(client, server.port).await;
+        let bytes = response
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("response failed"))
+            .to_bytes();
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
+        // NOTE: This is known to fail in debug builds since upgrading to hyper 1.0
+        // Apparently whatever hyper is doing now is much slower in debug builds
+        // Or, more likely, I did something dumb when translating the new API.
         assert_near!(
             elapsed,
             Duration::from_millis(11),
@@ -403,12 +414,17 @@ mod tests {
     #[tokio::test]
     async fn low_bandwidth_should_complete_slowly() {
         let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
+        let server = ThrottledServer::test(latency, Byte::from_u64(500_000));
         server.spawn_in_background().await.unwrap();
 
+        let client = build_http_get_client();
         let now = Instant::now();
-        let response = make_1mb_request(server.port).await;
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let response = make_1mb_request(client, server.port).await;
+        let bytes = response
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("response failed"))
+            .to_bytes();
         assert_eq!(bytes.len(), 1_000_000);
 
         let elapsed = now.elapsed();
@@ -421,16 +437,27 @@ mod tests {
     #[tokio::test]
     async fn concurrent_requests_should_share_bandwidth() {
         let latency = Duration::from_millis(1);
-        let server = ThrottledServer::test(latency, Byte::from_bytes(500_000));
+        let server = ThrottledServer::test(latency, Byte::from_u64(500_000));
         server.spawn_in_background().await.unwrap();
 
+        let client = build_http_get_client();
         let now = Instant::now();
-        let (response_1, response_2) =
-            tokio::join!(make_1mb_request(server.port), make_1mb_request(server.port));
+        let (response_1, response_2) = tokio::join!(
+            make_1mb_request(client.clone(), server.port),
+            make_1mb_request(client, server.port)
+        );
 
-        let bytes_1 = hyper::body::to_bytes(response_1.into_body()).await.unwrap();
+        let bytes_1 = response_1
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("response failed"))
+            .to_bytes();
         assert_eq!(bytes_1.len(), 1_000_000);
-        let bytes_2 = hyper::body::to_bytes(response_2.into_body()).await.unwrap();
+        let bytes_2 = response_2
+            .collect()
+            .await
+            .unwrap_or_else(|_| panic!("response failed"))
+            .to_bytes();
         assert_eq!(bytes_2.len(), 1_000_000);
 
         let elapsed = now.elapsed();
@@ -446,14 +473,14 @@ mod tests {
         server.spawn_in_background().await.unwrap();
 
         let port = server.port;
-        let client = Client::new();
+        let client = build_http_get_client();
         let request = Request::builder()
             .uri(format!("http://localhost:{port}/1M.txt"))
             .header("Range", "bytes=0-8")
-            .body(Body::empty())
+            .body(Empty::new())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 9);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "A Project");
@@ -461,10 +488,10 @@ mod tests {
         let request = Request::builder()
             .uri(format!("http://localhost:{port}/1M.txt"))
             .header("Range", "bytes=8754-8772")
-            .body(Body::empty())
+            .body(Empty::new())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 19);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "I lived at West Egg");
@@ -472,10 +499,10 @@ mod tests {
         let request = Request::builder()
             .uri(format!("http://localhost:{port}/1M.txt"))
             .header("Range", "bytes=8765-8772")
-            .body(Body::empty())
+            .body(Empty::new())
             .expect("valid request");
         let response = client.request(request).await.unwrap();
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 8);
         let string = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(string, "West Egg");

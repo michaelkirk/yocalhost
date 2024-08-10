@@ -16,7 +16,7 @@ struct Args {
     latency: u64,
 
     /// bandwidth (per second) accepts a string like "1.1Mb" or "512kb"
-    #[arg(short, long, default_value_t=Byte::from_bytes(1000000))]
+    #[arg(short, long, default_value_t=Byte::from_u64(1000000))]
     bandwidth: Byte,
 
     /// Path to root directory of files hosted by the webserver.
@@ -38,12 +38,7 @@ async fn main() {
     let latency = Duration::from_millis(args.latency);
     let bandwidth = args.bandwidth;
 
-    let server = ThrottledServer::new(
-        port,
-        latency,
-        bandwidth.get_bytes() as usize,
-        &args.web_root,
-    );
+    let server = ThrottledServer::new(port, latency, bandwidth.as_u64(), &args.web_root);
 
     // Not actually waiting here? Why isn't the server starting?
     server.serve().await

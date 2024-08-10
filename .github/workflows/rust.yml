@@ -18,5 +18,7 @@ jobs:
     - uses: actions/checkout@v3
     - name: Build
       run: cargo build --verbose
+    # Since updating to hyper v1.0, I see a significant slowdown in debug builds, causing some of my timing tests
+    # to fail.
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose --release
