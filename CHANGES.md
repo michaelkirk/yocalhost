@@ -1,8 +1,10 @@
 # Changelog
 
-## 0.5.0 - released 2023.11.16
+## 0.5.0 - released 2024.08.09
 
 - BREAKING: bandwidth is now u64, not usize
+- Update hyper to v1.0 - this isn't a change to the public API, but it was a
+  large change so has a higher-than-likely chance of introducing a regression.
 
 ## 0.4.0 - released 2023.11.16
 
