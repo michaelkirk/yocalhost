@@ -134,15 +134,25 @@ async fn throttled_download(
 
 /// An HTTP server that imposes artificial latency and bandwidth limits.
 ///
+/// You can start an instance from the command line:
+/// ```ignore
+/// # install yocalhost to your system
+/// cargo install yocalhost
+///
+/// # start up a throttled server with 100ms latency and 1Mb bandwidth restrictions
+/// yocalhost -p 8845 -l 100 -b "1Mb" path/to/web_root
+/// ```
+///
+/// Or you invoke programatically, e.g. in your test suite setup.
 /// ```no_run
 /// use yocalhost::ThrottledServer;
 /// use std::time::Duration;
 /// # async fn start() {
-/// let server = ThrottledServer::new(8845, Duration::from_millis(100), 1_000_000, "path/to/test-fixtures");
+/// let server = ThrottledServer::new(8845, Duration::from_millis(100), 1_000_000, "path/to/web_root");
 /// server.spawn_in_background().await.expect("proper startup");
 /// # }
 ///
-/// // now you can make your requests against http://localhost:9999
+/// // now you can make your requests against http://localhost:8845
 /// ```
 #[derive(Clone, Debug)]
 pub struct ThrottledServer {
