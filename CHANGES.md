@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Throttle at the network layer instead of per request, so new connections
+  cost a TCP handshake round trip.
+- BREAKING: `latency` is the round trip time of every exchange, so a request
+  on a fresh connection now takes two round trips rather than one.
+- `spawn_in_background` no longer requires a `1M.txt` in the web root.
+
 ## 0.5.0 - released 2024.08.09
 
 - BREAKING: bandwidth is now u64, not usize

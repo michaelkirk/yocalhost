@@ -1,8 +1,13 @@
 ## localhost too fast? try yocalhost.
 
-yocalhost is an http development server that simulates latency and bandwidth limitations. 
+yocalhost is an http development server that simulates latency and bandwidth limitations.
 
-It supports Range requests, and will throttle bandwidth across all concurrent connections.
+Throttling happens at the network layer: every packet is delayed by half the
+round trip latency, and bandwidth is shared across all concurrent connections.
+So opening a connection costs a TCP handshake round trip, like on a real
+network.
+
+It supports Range requests.
 
 ### Motivation
 
