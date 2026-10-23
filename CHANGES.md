@@ -9,6 +9,7 @@
 - BREAKING: `web_root()` returns `Option<&Path>`.
 - Add HTTPS with a self-signed certificate: `ThrottledServer::new_https`,
   `yocalhost --https`.
+- Serve HTTP/2 to clients that negotiate it.
 - Add reverse proxy mode for any TCP service: `ThrottledServer::new_proxy`,
   `yocalhost --upstream <addr>`.
 - `spawn_in_background` no longer requires a `1M.txt` in the web root.

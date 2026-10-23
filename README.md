@@ -2,7 +2,7 @@
 
 yocalhost is a throttled HTTP(S) development server: it serves a directory of
 files with artificial latency and bandwidth limits. It supports Range requests,
-and HTTPS with a self-signed certificate.
+and HTTPS (HTTP/1.1 or HTTP/2) with a self-signed certificate.
 
 Throttling happens at the TCP layer, not per HTTP request: every packet is
 delayed by half the round trip latency, and bandwidth is shared across all

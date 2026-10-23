@@ -337,54 +337,94 @@ mod tests {
         response.collect().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn https() {
-        let latency = Duration::from_millis(50);
-        let server = ThrottledServer::new_https(
-            ThrottledServer::next_port(),
-            latency,
-            Byte::from_str("1 Gb").unwrap().as_u64(),
-            "test_data",
-        );
-        server.spawn_in_background().await.unwrap();
-
+    /// Connects to `server` over TLS, offering `alpn_protocols`.
+    async fn tls_connect(
+        server: &ThrottledServer,
+        alpn_protocols: &[&[u8]],
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
         let certificate = rustls::pki_types::pem::PemObject::from_pem_slice(
             server.certificate_pem().unwrap().as_bytes(),
         )
         .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).unwrap();
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
+        config.alpn_protocols = alpn_protocols.iter().map(|p| p.to_vec()).collect();
 
-        let now = Instant::now();
         let tcp = TcpStream::connect(("127.0.0.1", server.port))
             .await
             .unwrap();
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect("localhost".try_into().unwrap(), tcp)
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    fn https_test_server(latency: Duration) -> ThrottledServer {
+        ThrottledServer::new_https(
+            ThrottledServer::next_port(),
+            latency,
+            Byte::from_str("1 Gb").unwrap().as_u64(),
+            "test_data",
+        )
+    }
+
+    fn gatsby_request() -> Request<Empty<Bytes>> {
+        Request::get("https://localhost/gatsby.txt")
+            .header("Host", "localhost")
+            .body(Empty::new())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn https() {
+        let latency = Duration::from_millis(50);
+        let server = https_test_server(latency);
+        server.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let tls = tls_connect(&server, &[b"http/1.1"]).await;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
             .await
             .unwrap();
         tokio::spawn(connection);
-        let request = Request::get("/gatsby.txt")
-            .header("Host", "localhost")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let response = sender.send_request(request).await.unwrap();
+        let response = sender.send_request(gatsby_request()).await.unwrap();
         let bytes = response.collect().await.unwrap().to_bytes();
         assert!(String::from_utf8(bytes.to_vec())
             .unwrap()
             .contains("West Egg"));
 
         // TCP handshake, TLS 1.3 handshake, then the request.
+        assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn http2_multiplexes_requests() {
+        let latency = Duration::from_millis(50);
+        let server = https_test_server(latency);
+        server.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let tls = tls_connect(&server, &[b"h2"]).await;
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        let get = |mut sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>| async move {
+            let response = sender.send_request(gatsby_request()).await.unwrap();
+            assert_eq!(response.version(), hyper::Version::HTTP_2);
+            response.collect().await.unwrap();
+        };
+        tokio::join!(get(sender.clone()), get(sender));
+
+        // Both requests share one round trip after the TCP and TLS handshakes.
         assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
     }
 

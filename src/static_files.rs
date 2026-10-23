@@ -1,7 +1,7 @@
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_staticfile::Static;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -68,7 +68,7 @@ impl Tls {
         .with_no_client_auth()
         .with_single_cert(vec![certified_key.cert.der().clone()], key)
         .expect("valid certificate");
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             certificate_pem: certified_key.cert.pem(),
@@ -132,7 +132,7 @@ impl StaticFiles {
     async fn serve_http(
         &self,
         io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    ) -> Result<(), hyper::Error> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let files = self.files.clone();
         let stats = self.stats.clone();
         let service = service_fn(move |request| {
@@ -145,7 +145,7 @@ impl StaticFiles {
                 Ok::<_, std::io::Error>(response)
             }
         });
-        http1::Builder::new()
+        auto::Builder::new(TokioExecutor::new())
             .serve_connection(TokioIo::new(io), service)
             .await
     }
