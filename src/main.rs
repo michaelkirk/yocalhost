@@ -21,12 +21,16 @@ struct Args {
 
     /// Path to root directory of files hosted by the webserver.
     /// Defaults to present directory.
-    #[arg(short, long, default_value = ".")]
+    #[arg(short, long, default_value = ".", conflicts_with = "upstream")]
     web_root: PathBuf,
 
     /// Serve files over HTTPS, with a self-signed certificate.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "upstream")]
     https: bool,
+
+    /// Instead of serving files, forward connections to this address, e.g. "127.0.0.1:8080".
+    #[arg(short, long)]
+    upstream: Option<String>,
 }
 
 #[tokio::main]
@@ -42,10 +46,12 @@ async fn main() {
     let latency = Duration::from_millis(args.latency);
     let bytes_per_second = args.bandwidth.as_u64();
 
-    let server = if args.https {
-        ThrottledServer::new_https(port, latency, bytes_per_second, &args.web_root)
-    } else {
-        ThrottledServer::new(port, latency, bytes_per_second, &args.web_root)
+    let server = match args.upstream {
+        Some(upstream) => ThrottledServer::new_proxy(port, latency, bytes_per_second, upstream),
+        None if args.https => {
+            ThrottledServer::new_https(port, latency, bytes_per_second, &args.web_root)
+        }
+        None => ThrottledServer::new(port, latency, bytes_per_second, &args.web_root),
     };
 
     server.serve().await

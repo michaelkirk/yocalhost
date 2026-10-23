@@ -2,7 +2,7 @@
 name = "yocalhost"
 version = "0.5.0"
 edition = "2021"
-description = "an http(s) development server that simulates latency and bandwidth limitations"
+description = "a throttled HTTP(S) development server, or proxy for any TCP service, that simulates latency and bandwidth limitations"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michaelkirk/yocalhost"
 exclude = ["test_data/"]

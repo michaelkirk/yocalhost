@@ -18,9 +18,9 @@ pub type Error = Box<dyn std::error::Error>;
 /// Buffer between the throttled link and the built-in file server.
 const STATIC_FILES_BUFFER_SIZE: usize = 64 * 1024;
 
-/// A server that imposes artificial latency and bandwidth limits.
+/// An HTTP(S) file server, or a proxy for any TCP service, with artificial latency and bandwidth limits.
 ///
-/// Throttling happens at the network layer, so TCP and TLS handshakes cost round trips like they
+/// Throttling happens at the TCP layer, so TCP and TLS handshakes cost round trips like they
 /// would on a real network.
 ///
 /// You can start an instance from the command line:
@@ -30,6 +30,9 @@ const STATIC_FILES_BUFFER_SIZE: usize = 64 * 1024;
 ///
 /// # start up a throttled server with 100ms latency and 1Mb bandwidth restrictions
 /// yocalhost -p 8845 -l 100 -b "1Mb" -w path/to/web_root
+///
+/// # or put the same restrictions in front of a service on port 8080
+/// yocalhost -p 8845 -l 100 -b "1Mb" --upstream 127.0.0.1:8080
 /// ```
 ///
 /// Or you invoke programatically, e.g. in your test suite setup.
@@ -47,7 +50,13 @@ const STATIC_FILES_BUFFER_SIZE: usize = 64 * 1024;
 pub struct ThrottledServer {
     port: u16,
     link: Link,
-    files: StaticFiles,
+    upstream: Upstream,
+}
+
+#[derive(Clone)]
+enum Upstream {
+    Address(String),
+    StaticFiles(StaticFiles),
 }
 
 impl ThrottledServer {
@@ -59,7 +68,12 @@ impl ThrottledServer {
         web_root: impl Into<PathBuf>,
     ) -> Self {
         let files = StaticFiles::http(web_root.into());
-        Self::with_files(port, latency, bytes_per_second, files)
+        Self::with_upstream(
+            port,
+            latency,
+            bytes_per_second,
+            Upstream::StaticFiles(files),
+        )
     }
 
     /// Serves the files in `web_root` over HTTPS, using a self-signed certificate.
@@ -72,14 +86,35 @@ impl ThrottledServer {
         web_root: impl Into<PathBuf>,
     ) -> Self {
         let files = StaticFiles::https(web_root.into());
-        Self::with_files(port, latency, bytes_per_second, files)
+        Self::with_upstream(
+            port,
+            latency,
+            bytes_per_second,
+            Upstream::StaticFiles(files),
+        )
     }
 
-    fn with_files(port: u16, latency: Duration, bytes_per_second: u64, files: StaticFiles) -> Self {
+    /// Forwards each connection to the service at `upstream`, e.g. "127.0.0.1:8080".
+    pub fn new_proxy(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        upstream: impl Into<String>,
+    ) -> Self {
+        let upstream = Upstream::Address(upstream.into());
+        Self::with_upstream(port, latency, bytes_per_second, upstream)
+    }
+
+    fn with_upstream(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        upstream: Upstream,
+    ) -> Self {
         Self {
             port,
             link: Link::new(latency, bytes_per_second),
-            files,
+            upstream,
         }
     }
 
@@ -88,13 +123,20 @@ impl ThrottledServer {
         Self::new(Self::next_port(), latency, bandwidth.as_u64(), "test_data")
     }
 
-    pub fn web_root(&self) -> &Path {
-        self.files.web_root()
+    /// The directory being served, unless this is a proxy.
+    pub fn web_root(&self) -> Option<&Path> {
+        match &self.upstream {
+            Upstream::Address(_) => None,
+            Upstream::StaticFiles(files) => Some(files.web_root()),
+        }
     }
 
     /// The self-signed certificate of a server created with [`Self::new_https`].
     pub fn certificate_pem(&self) -> Option<&str> {
-        self.files.certificate_pem()
+        match &self.upstream {
+            Upstream::Address(_) => None,
+            Upstream::StaticFiles(files) => files.certificate_pem(),
+        }
     }
 
     pub fn port(&self) -> u16 {
@@ -114,7 +156,14 @@ impl ThrottledServer {
             .await
             .unwrap_or_else(|err| panic!("unable to bind to port {}: {err}", self.port));
         let addr = listener.local_addr().expect("bound listener");
-        println!("Listening on {}://{addr}", self.files.scheme_name());
+        match &self.upstream {
+            Upstream::Address(upstream) => {
+                println!("Listening on {addr}, forwarding to {upstream}")
+            }
+            Upstream::StaticFiles(files) => {
+                println!("Listening on {}://{addr}", files.scheme_name())
+            }
+        }
         self.accept_connections(listener).await
     }
 
@@ -135,9 +184,20 @@ impl ThrottledServer {
     }
 
     async fn handle_connection(self, client: TcpStream) {
-        let (link_end, server_end) = tokio::io::duplex(STATIC_FILES_BUFFER_SIZE);
-        tokio::spawn(self.files.clone().serve_connection(server_end));
-        self.link.relay(client, link_end).await
+        match &self.upstream {
+            Upstream::Address(addr) => match TcpStream::connect(addr).await {
+                Ok(upstream) => {
+                    let _ = upstream.set_nodelay(true);
+                    self.link.relay(client, upstream).await
+                }
+                Err(err) => warn!("unable to connect to upstream {addr}: {err}"),
+            },
+            Upstream::StaticFiles(files) => {
+                let (link_end, server_end) = tokio::io::duplex(STATIC_FILES_BUFFER_SIZE);
+                tokio::spawn(files.clone().serve_connection(server_end));
+                self.link.relay(client, link_end).await
+            }
+        }
     }
 
     #[cfg(test)]
@@ -326,6 +386,27 @@ mod tests {
 
         // TCP handshake, TLS 1.3 handshake, then the request.
         assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn proxy() {
+        let unthrottled = ThrottledServer::test(Duration::ZERO, Byte::from_str("1 GB").unwrap());
+        unthrottled.spawn_in_background().await.unwrap();
+
+        let latency = Duration::from_millis(50);
+        let proxy = ThrottledServer::new_proxy(
+            ThrottledServer::next_port(),
+            latency,
+            Byte::from_str("1 GB").unwrap().as_u64(),
+            format!("127.0.0.1:{}", unthrottled.port),
+        );
+        proxy.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let response = make_1mb_request(build_http_get_client(), proxy.port).await;
+        let bytes = response.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 1_000_000);
+        assert_near!(now.elapsed(), 2 * latency, Duration::from_millis(20));
     }
 
     #[tokio::test]
