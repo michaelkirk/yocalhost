@@ -23,6 +23,10 @@ struct Args {
     /// Defaults to present directory.
     #[arg(short, long, default_value = ".")]
     web_root: PathBuf,
+
+    /// Serve files over HTTPS, with a self-signed certificate.
+    #[arg(long)]
+    https: bool,
 }
 
 #[tokio::main]
@@ -38,7 +42,11 @@ async fn main() {
     let latency = Duration::from_millis(args.latency);
     let bytes_per_second = args.bandwidth.as_u64();
 
-    let server = ThrottledServer::new(port, latency, bytes_per_second, &args.web_root);
+    let server = if args.https {
+        ThrottledServer::new_https(port, latency, bytes_per_second, &args.web_root)
+    } else {
+        ThrottledServer::new(port, latency, bytes_per_second, &args.web_root)
+    };
 
     server.serve().await
 }

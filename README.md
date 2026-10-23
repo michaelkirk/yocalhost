@@ -1,13 +1,14 @@
 ## localhost too fast? try yocalhost.
 
-yocalhost is an http development server that simulates latency and bandwidth limitations.
+yocalhost is an http(s) development server that simulates latency and bandwidth limitations.
 
 Throttling happens at the network layer: every packet is delayed by half the
 round trip latency, and bandwidth is shared across all concurrent connections.
-So opening a connection costs a TCP handshake round trip, like on a real
-network.
+So opening a connection costs a TCP handshake round trip, and HTTPS costs its
+TLS handshake too, like on a real network.
 
-It supports Range requests.
+It serves a directory over HTTP, or HTTPS with a self-signed certificate, and
+supports Range requests.
 
 ### Motivation
 
@@ -38,6 +39,9 @@ yocalhost
 # Start on port 8888, simulating a 100 megabit connection with 50ms latency
 yocalhost -p 8888 -b "100Mbit" -l 50
 
+# Serve over HTTPS with a self-signed certificate (e.g. `curl -k`)
+yocalhost --https
+
 # See other options
 yocalhost --help
 ```
@@ -55,6 +59,7 @@ let bytes_per_second = 100_000_000 / 8;
 let web_root = "../../test/data";
 
 let server = ThrottledServer::new(port, latency_ms, bytes_per_second, web_root);
+// or ThrottledServer::new_https(...), trusting `server.certificate_pem()` in your client
     
 let runtime = tokio::runtime::Runtime::new().unwrap(); : Runtime    
 runtime.spawn(async move {

@@ -2,7 +2,7 @@
 name = "yocalhost"
 version = "0.5.0"
 edition = "2021"
-description = "an http development server that simulates latency and bandwidth limitations"
+description = "an http(s) development server that simulates latency and bandwidth limitations"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/michaelkirk/yocalhost"
 exclude = ["test_data/"]
@@ -21,7 +21,9 @@ hyper = { version = "1.4.1", features = ["full"] }
 hyper-staticfile = "0.10.1"
 hyper-util = { version = "0.1.7", features = ["full"] }
 log = "0.4.20"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { version = "1.32.0", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "ring", "tls12"] }
 
 [dev-dependencies]
 http-body-util = "0.1.2"

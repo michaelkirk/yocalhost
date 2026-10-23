@@ -20,8 +20,8 @@ const STATIC_FILES_BUFFER_SIZE: usize = 64 * 1024;
 
 /// A server that imposes artificial latency and bandwidth limits.
 ///
-/// Throttling happens at the network layer, so TCP handshakes cost a round trip like they would on
-/// a real network.
+/// Throttling happens at the network layer, so TCP and TLS handshakes cost round trips like they
+/// would on a real network.
 ///
 /// You can start an instance from the command line:
 /// ```ignore
@@ -62,6 +62,19 @@ impl ThrottledServer {
         Self::with_files(port, latency, bytes_per_second, files)
     }
 
+    /// Serves the files in `web_root` over HTTPS, using a self-signed certificate.
+    ///
+    /// Clients must trust [`Self::certificate_pem`] or skip certificate verification.
+    pub fn new_https(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        web_root: impl Into<PathBuf>,
+    ) -> Self {
+        let files = StaticFiles::https(web_root.into());
+        Self::with_files(port, latency, bytes_per_second, files)
+    }
+
     fn with_files(port: u16, latency: Duration, bytes_per_second: u64, files: StaticFiles) -> Self {
         Self {
             port,
@@ -77,6 +90,11 @@ impl ThrottledServer {
 
     pub fn web_root(&self) -> &Path {
         self.files.web_root()
+    }
+
+    /// The self-signed certificate of a server created with [`Self::new_https`].
+    pub fn certificate_pem(&self) -> Option<&str> {
+        self.files.certificate_pem()
     }
 
     pub fn port(&self) -> u16 {
@@ -96,7 +114,7 @@ impl ThrottledServer {
             .await
             .unwrap_or_else(|err| panic!("unable to bind to port {}: {err}", self.port));
         let addr = listener.local_addr().expect("bound listener");
-        println!("Listening on http://{addr}");
+        println!("Listening on {}://{addr}", self.files.scheme_name());
         self.accept_connections(listener).await
     }
 
@@ -152,7 +170,9 @@ mod tests {
     use hyper_util::client::legacy::{connect::HttpConnector, Client};
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::Instant;
+    use tokio_rustls::rustls;
 
     type GetClient = Client<HttpConnector, Empty<&'static [u8]>>;
 
@@ -255,6 +275,57 @@ mod tests {
             .unwrap();
         let response = sender.send_request(request).await.unwrap();
         response.collect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn https() {
+        let latency = Duration::from_millis(50);
+        let server = ThrottledServer::new_https(
+            ThrottledServer::next_port(),
+            latency,
+            Byte::from_str("1 Gb").unwrap().as_u64(),
+            "test_data",
+        );
+        server.spawn_in_background().await.unwrap();
+
+        let certificate = rustls::pki_types::pem::PemObject::from_pem_slice(
+            server.certificate_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let now = Instant::now();
+        let tcp = TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let request = Request::get("/gatsby.txt")
+            .header("Host", "localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("West Egg"));
+
+        // TCP handshake, TLS 1.3 handshake, then the request.
+        assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
     }
 
     #[tokio::test]
