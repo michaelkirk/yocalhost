@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Throttle at the network layer instead of per request, so new connections
+  cost a TCP handshake round trip (and a TLS handshake for HTTPS).
+- BREAKING: `latency` is the round trip time of every exchange, so a request
+  on a fresh connection now takes two round trips rather than one.
+- BREAKING: `web_root()` returns `Option<&Path>`.
+- Add HTTPS with a self-signed certificate: `ThrottledServer::new_https`,
+  `yocalhost --https`.
+- Serve HTTP/2 to clients that negotiate it.
+- Add reverse proxy mode for any TCP service: `ThrottledServer::new_proxy`,
+  `yocalhost --upstream <addr>`.
+- `spawn_in_background` no longer requires a `1M.txt` in the web root.
+
 ## 0.5.0 - released 2024.08.09
 
 - BREAKING: bandwidth is now u64, not usize

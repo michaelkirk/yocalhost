@@ -1,138 +1,27 @@
 use std::fmt::Debug;
-use async_speed_limit::Limiter;
-#[cfg(test)]
-use byte_unit::Byte;
-use futures::StreamExt;
-use hyper::{
-    body::Bytes,
-    Request, Response, Uri,
-};
-use hyper_staticfile::Static;
-use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout};
-
-use http_body_util::{Empty, StreamBody};
-use hyper::body::{Body, Buf, Frame, Incoming as IncomingBody};
-use hyper::server::conn::http1;
-use hyper::service::Service;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use std::future::Future;
-use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+
+mod link;
+mod static_files;
+
+use link::Link;
+use static_files::StaticFiles;
 
 #[macro_use]
 extern crate log;
 
 pub type Error = Box<dyn std::error::Error>;
 
-// It seems crazy that we need to be this verbose for a basic "HTTP Get client",
-// but I'm not sure how to make it simpler.
-type GetClient = Client<HttpConnector, Empty<&'static [u8]>>;
+/// Buffer between the throttled link and the built-in file server.
+const STATIC_FILES_BUFFER_SIZE: usize = 64 * 1024;
 
-fn build_http_get_client() -> GetClient {
-    Client::builder(TokioExecutor::new()).build_http()
-}
-
-mod stats {
-    #[derive(Debug, Default)]
-    pub(crate) struct Response {
-        pub len: usize,
-    }
-
-    #[derive(Debug, Default)]
-    pub(crate) struct Stats {
-        pub responses: Vec<Response>,
-    }
-
-    impl Stats {
-        pub fn print_summary(&self) {
-            let req_count = self.responses.len();
-            let body_bytes_sent: usize = self.responses.iter().map(|r| r.len).sum();
-            debug!("req_count: {req_count}, body_bytes_sent: {body_bytes_sent}");
-        }
-
-        pub fn push_response(&mut self, response: Response) {
-            self.responses.push(response)
-        }
-    }
-}
-type Stats = Arc<Mutex<stats::Stats>>;
-
-async fn throttled_response<B: Body + Send + Unpin + 'static>(
-    upstream_response: Response<B>,
-    limiter: Limiter,
-    stats: Stats,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error>
-where
-    B::Error: Debug,
-    B::Data: Debug + Send,
-{
-    let (upstream_parts, upstream_body) = upstream_response.into_parts();
-
-    // REVIEW: buffer size
-    let buffer_size = 8 * 1024;
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(buffer_size);
-
-    let byte_stream = ReceiverStream::new(rx);
-
-    tokio::spawn(async move {
-        let mut response_stats = stats::Response::default();
-
-        let mut data_stream = upstream_body.collect().await.unwrap().into_data_stream();
-        while let Some(chunk) = data_stream.next().await.transpose().unwrap() {
-            let buffer_1 = chunk.chunk();
-            response_stats.len += buffer_1.len();
-            let mut limited_buffer = limiter.clone().limit(Cursor::new(&buffer_1));
-            let mut buffer_2 = vec![];
-
-            limited_buffer.read_to_end(&mut buffer_2).await.unwrap();
-
-            let back_out_again = Bytes::from(buffer_2);
-            // There's an error occurring during tests here, it doesn't seem to interfere
-            // with the tests. Maybe we need a more judicious shutdown to avoid the spurious
-            // output?
-            match tx.send(Ok(Frame::data(back_out_again))).await {
-                Ok(()) => (),
-                // This case often happens when client disconnects after a successful request.
-                // It'd be nice to ensure all data had been sent, but I'm not sure.
-                // Err(hyper_error) if hyper_error.is_closed() => break,
-                Err(other) => panic!("err: {other}"),
-            }
-        }
-        let mut stats = stats.lock().unwrap();
-        if cfg!(feature = "stats") {
-            stats.push_response(response_stats);
-            stats.print_summary()
-        }
-    });
-
-    let stream_body = StreamBody::new(byte_stream);
-    Ok(Response::from_parts(
-        upstream_parts,
-        BoxBody::new(stream_body),
-    ))
-}
-
-async fn throttled_download(
-    req: Request<hyper::body::Incoming>,
-    limiter: Limiter,
-    static_files: Static,
-    stats: Stats,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    let response = static_files
-        .serve(req)
-        .await
-        .expect("TODO: handle error conversion");
-    throttled_response(response, limiter, stats).await
-}
-
-/// An HTTP server that imposes artificial latency and bandwidth limits.
+/// An HTTP(S) file server, or a proxy for any TCP service, with artificial latency and bandwidth limits.
+///
+/// Throttling happens at the TCP layer, so TCP and TLS handshakes cost round trips like they
+/// would on a real network.
 ///
 /// You can start an instance from the command line:
 /// ```ignore
@@ -140,7 +29,10 @@ async fn throttled_download(
 /// cargo install yocalhost
 ///
 /// # start up a throttled server with 100ms latency and 1Mb bandwidth restrictions
-/// yocalhost -p 8845 -l 100 -b "1Mb" path/to/web_root
+/// yocalhost -p 8845 -l 100 -b "1Mb" -w path/to/web_root
+///
+/// # or put the same restrictions in front of a service on port 8080
+/// yocalhost -p 8845 -l 100 -b "1Mb" --upstream 127.0.0.1:8080
 /// ```
 ///
 /// Or you invoke programatically, e.g. in your test suite setup.
@@ -154,93 +46,158 @@ async fn throttled_download(
 ///
 /// // now you can make your requests against http://localhost:8845
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ThrottledServer {
     port: u16,
-    latency: Duration,
-    limiter: Limiter,
-    stats: Stats,
-    web_root: PathBuf,
-    client: GetClient,
+    link: Link,
+    upstream: Upstream,
+}
+
+#[derive(Clone)]
+enum Upstream {
+    Address(String),
+    StaticFiles(StaticFiles),
 }
 
 impl ThrottledServer {
-    #[cfg(test)]
-    fn test(latency: Duration, bandwidth: Byte) -> Self {
-        let web_root = "test_data";
-        Self::new(
-            Self::next_port(),
-            latency,
-            bandwidth.as_u64(),
-            PathBuf::from(web_root),
-        )
-    }
-
+    /// Serves the files in `web_root` over HTTP.
     pub fn new(
         port: u16,
         latency: Duration,
         bytes_per_second: u64,
         web_root: impl Into<PathBuf>,
     ) -> Self {
-        let stats = Arc::new(Mutex::new(stats::Stats::default()));
-        Self {
+        let files = StaticFiles::http(web_root.into());
+        Self::with_upstream(
             port,
             latency,
-            limiter: Limiter::new(bytes_per_second as f64),
-            stats,
-            web_root: web_root.into(),
-            client: build_http_get_client(),
+            bytes_per_second,
+            Upstream::StaticFiles(files),
+        )
+    }
+
+    /// Serves the files in `web_root` over HTTPS, using a self-signed certificate.
+    ///
+    /// Clients must trust [`Self::certificate_pem`] or skip certificate verification.
+    pub fn new_https(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        web_root: impl Into<PathBuf>,
+    ) -> Self {
+        let files = StaticFiles::https(web_root.into());
+        Self::with_upstream(
+            port,
+            latency,
+            bytes_per_second,
+            Upstream::StaticFiles(files),
+        )
+    }
+
+    /// Forwards each connection to the service at `upstream`, e.g. "127.0.0.1:8080".
+    pub fn new_proxy(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        upstream: impl Into<String>,
+    ) -> Self {
+        let upstream = Upstream::Address(upstream.into());
+        Self::with_upstream(port, latency, bytes_per_second, upstream)
+    }
+
+    fn with_upstream(
+        port: u16,
+        latency: Duration,
+        bytes_per_second: u64,
+        upstream: Upstream,
+    ) -> Self {
+        Self {
+            port,
+            link: Link::new(latency, bytes_per_second),
+            upstream,
         }
     }
 
-    pub fn web_root(&self) -> &Path {
-        &self.web_root
+    #[cfg(test)]
+    fn test(latency: Duration, bandwidth: byte_unit::Byte) -> Self {
+        Self::new(Self::next_port(), latency, bandwidth.as_u64(), "test_data")
+    }
+
+    /// The directory being served, unless this is a proxy.
+    pub fn web_root(&self) -> Option<&Path> {
+        match &self.upstream {
+            Upstream::Address(_) => None,
+            Upstream::StaticFiles(files) => Some(files.web_root()),
+        }
+    }
+
+    /// The self-signed certificate of a server created with [`Self::new_https`].
+    pub fn certificate_pem(&self) -> Option<&str> {
+        match &self.upstream {
+            Upstream::Address(_) => None,
+            Upstream::StaticFiles(files) => files.certificate_pem(),
+        }
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
+    /// Starts accepting connections on a background task.
     pub async fn spawn_in_background(&self) -> Result<(), Error> {
-        let server = self.clone();
-        tokio::spawn(server.clone().serve());
-        self.wait_for_start().await
+        let listener = self.bind().await?;
+        tokio::spawn(self.clone().accept_connections(listener));
+        Ok(())
     }
 
-    async fn wait_for_start(&self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        let port = self.port;
-        let client = self.client.clone();
-
-        tokio::spawn(async move {
-            let uri = format!("http://localhost:{port}/1M.txt")
-                .parse::<Uri>()
-                .unwrap();
-
-            loop {
-                let is_up = client
-                    .get(uri.clone())
-                    .await
-                    .map(|resp| resp.status().is_success())
-                    .unwrap_or(false);
-
-                if is_up {
-                    debug!("ping succeeded");
-                    tx.send(()).unwrap();
-                    break;
-                } else {
-                    debug!("ping failed");
-                }
-                sleep(Duration::from_micros(100)).await;
-            }
-        });
-
-        let _ = timeout(self.latency + Duration::from_millis(400), rx)
+    pub async fn serve(self) {
+        let listener = self
+            .bind()
             .await
-            .expect("startup timed out");
+            .unwrap_or_else(|err| panic!("unable to bind to port {}: {err}", self.port));
+        let addr = listener.local_addr().expect("bound listener");
+        match &self.upstream {
+            Upstream::Address(upstream) => {
+                println!("Listening on {addr}, forwarding to {upstream}")
+            }
+            Upstream::StaticFiles(files) => {
+                println!("Listening on {}://{addr}", files.scheme_name())
+            }
+        }
+        self.accept_connections(listener).await
+    }
 
-        debug!("finished starting");
-        Ok(())
+    async fn bind(&self) -> std::io::Result<TcpListener> {
+        let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
+        TcpListener::bind(addr).await
+    }
+
+    async fn accept_connections(self, listener: TcpListener) {
+        loop {
+            let (client, _) = listener
+                .accept()
+                .await
+                .expect("listener to bind to accept.");
+            let _ = client.set_nodelay(true);
+            tokio::spawn(self.clone().handle_connection(client));
+        }
+    }
+
+    async fn handle_connection(self, client: TcpStream) {
+        match &self.upstream {
+            Upstream::Address(addr) => match TcpStream::connect(addr).await {
+                Ok(upstream) => {
+                    let _ = upstream.set_nodelay(true);
+                    self.link.relay(client, upstream).await
+                }
+                Err(err) => warn!("unable to connect to upstream {addr}: {err}"),
+            },
+            Upstream::StaticFiles(files) => {
+                let (link_end, server_end) = tokio::io::duplex(STATIC_FILES_BUFFER_SIZE);
+                tokio::spawn(files.clone().serve_connection(server_end));
+                self.link.relay(client, link_end).await
+            }
+        }
     }
 
     #[cfg(test)]
@@ -251,60 +208,37 @@ impl ThrottledServer {
         *next = value + 1;
         value
     }
-
-    pub async fn serve(self) {
-        let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
-        let listener = TcpListener::bind(addr)
-            .await
-            .unwrap_or_else(|_| panic!("unable to bind to address: {addr:?}"));
-        println!("Listening on http://{}", addr);
-
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .expect("listener to bind to accept.");
-
-            let io = TokioIo::new(stream);
-            let svc_clone = self.clone();
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new().serve_connection(io, svc_clone).await {
-                    println!("Failed to serve connection: {:?}", err);
-                }
-            });
-        }
-    }
 }
 
-use http_body_util::{combinators::BoxBody, BodyExt};
-use hyper_util::client::legacy::connect::HttpConnector;
-use tokio::io::AsyncReadExt;
-use tokio_stream::wrappers::ReceiverStream;
-
-impl Service<Request<IncomingBody>> for ThrottledServer {
-    type Response = Response<BoxBody<Bytes, hyper::Error>>;
-    type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn call(&self, req: Request<IncomingBody>) -> Self::Future {
-        let static_files = Static::new(self.web_root.clone());
-        let limiter = self.limiter.clone();
-        let latency = self.latency;
-        let stats = self.stats.clone();
-
-        Box::pin(async move {
-            sleep(latency).await;
-            throttled_download(req, limiter, static_files, stats).await
-        })
+impl Debug for ThrottledServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThrottledServer")
+            .field("port", &self.port)
+            .field("link", &self.link)
+            .field("web_root", &self.web_root())
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
-    use std::time::Instant;
+    use byte_unit::Byte;
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::{Request, Response};
+    use hyper_util::client::legacy::{connect::HttpConnector, Client};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio_rustls::rustls;
+
+    type GetClient = Client<HttpConnector, Empty<&'static [u8]>>;
+
+    fn build_http_get_client() -> GetClient {
+        Client::builder(TokioExecutor::new()).build_http()
+    }
 
     #[test]
     fn next_port_increments() {
@@ -315,7 +249,7 @@ mod tests {
         assert!(second < third);
     }
 
-    async fn make_1mb_request(client: GetClient, port: u16) -> Response<impl Body> {
+    async fn make_1mb_request(client: GetClient, port: u16) -> Response<Incoming> {
         client
             .get(format!("http://localhost:{port}/1M.txt").parse().unwrap())
             .await
@@ -351,8 +285,9 @@ mod tests {
         let now = Instant::now();
         make_1mb_request(client, server.port).await;
         let elapsed = now.elapsed();
-        assert!(elapsed > server.latency);
-        assert!(elapsed < 2 * server.latency);
+        let latency = server.link.latency();
+        assert!(elapsed > 2 * latency);
+        assert!(elapsed < 3 * latency);
     }
 
     #[tokio::test]
@@ -364,34 +299,154 @@ mod tests {
         let now = Instant::now();
         make_1mb_request(client, server.port).await;
         let elapsed = now.elapsed();
-        assert!(elapsed > server.latency);
-        assert!(elapsed < 2 * server.latency);
+        let latency = server.link.latency();
+        assert!(elapsed > 2 * latency);
+        assert!(elapsed < 3 * latency);
     }
 
     #[tokio::test]
-    async fn latency() {
-        {
-            let latency = Duration::from_millis(50);
+    async fn new_connection_costs_a_handshake_round_trip() {
+        for latency in [Duration::from_millis(50), Duration::from_millis(100)] {
             let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
             server.spawn_in_background().await.unwrap();
+            let tolerance = Duration::from_millis(15);
 
-            let client = build_http_get_client();
-            let now = Instant::now();
-            make_1mb_request(client, server.port).await;
-            let elapsed = now.elapsed();
-            assert_near!(elapsed, latency, Duration::from_millis(10));
-        }
-        {
-            let latency = Duration::from_millis(100);
-            let server = ThrottledServer::test(latency, Byte::from_str("1 Gb").unwrap());
-            server.spawn_in_background().await.unwrap();
+            let started = Instant::now();
+            let tcp = TcpStream::connect(("127.0.0.1", server.port))
+                .await
+                .unwrap();
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                .await
+                .unwrap();
+            tokio::spawn(connection);
+            get_gatsby(&mut sender).await;
+            assert_near!(started.elapsed(), 2 * latency, tolerance);
 
-            let client = build_http_get_client();
-            let now = Instant::now();
-            make_1mb_request(client, server.port).await;
-            let elapsed = now.elapsed();
-            assert_near!(elapsed, latency, Duration::from_millis(10));
+            let started = Instant::now();
+            get_gatsby(&mut sender).await;
+            assert_near!(started.elapsed(), latency, tolerance);
         }
+    }
+
+    async fn get_gatsby(sender: &mut hyper::client::conn::http1::SendRequest<Empty<Bytes>>) {
+        let request = Request::get("/gatsby.txt")
+            .header("Host", "localhost")
+            .body(Empty::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        response.collect().await.unwrap();
+    }
+
+    /// Connects to `server` over TLS, offering `alpn_protocols`.
+    async fn tls_connect(
+        server: &ThrottledServer,
+        alpn_protocols: &[&[u8]],
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let certificate = rustls::pki_types::pem::PemObject::from_pem_slice(
+            server.certificate_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = alpn_protocols.iter().map(|p| p.to_vec()).collect();
+
+        let tcp = TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .unwrap();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap()
+    }
+
+    fn https_test_server(latency: Duration) -> ThrottledServer {
+        ThrottledServer::new_https(
+            ThrottledServer::next_port(),
+            latency,
+            Byte::from_str("1 Gb").unwrap().as_u64(),
+            "test_data",
+        )
+    }
+
+    fn gatsby_request() -> Request<Empty<Bytes>> {
+        Request::get("https://localhost/gatsby.txt")
+            .header("Host", "localhost")
+            .body(Empty::new())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn https() {
+        let latency = Duration::from_millis(50);
+        let server = https_test_server(latency);
+        server.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let tls = tls_connect(&server, &[b"http/1.1"]).await;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let response = sender.send_request(gatsby_request()).await.unwrap();
+        let bytes = response.collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("West Egg"));
+
+        // TCP handshake, TLS 1.3 handshake, then the request.
+        assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn http2_multiplexes_requests() {
+        let latency = Duration::from_millis(50);
+        let server = https_test_server(latency);
+        server.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let tls = tls_connect(&server, &[b"h2"]).await;
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        let get = |mut sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>| async move {
+            let response = sender.send_request(gatsby_request()).await.unwrap();
+            assert_eq!(response.version(), hyper::Version::HTTP_2);
+            response.collect().await.unwrap();
+        };
+        tokio::join!(get(sender.clone()), get(sender));
+
+        // Both requests share one round trip after the TCP and TLS handshakes.
+        assert_near!(now.elapsed(), 3 * latency, Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn proxy() {
+        let unthrottled = ThrottledServer::test(Duration::ZERO, Byte::from_str("1 GB").unwrap());
+        unthrottled.spawn_in_background().await.unwrap();
+
+        let latency = Duration::from_millis(50);
+        let proxy = ThrottledServer::new_proxy(
+            ThrottledServer::next_port(),
+            latency,
+            Byte::from_str("1 GB").unwrap().as_u64(),
+            format!("127.0.0.1:{}", unthrottled.port),
+        );
+        proxy.spawn_in_background().await.unwrap();
+
+        let now = Instant::now();
+        let response = make_1mb_request(build_http_get_client(), proxy.port).await;
+        let bytes = response.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 1_000_000);
+        assert_near!(now.elapsed(), 2 * latency, Duration::from_millis(20));
     }
 
     #[tokio::test]

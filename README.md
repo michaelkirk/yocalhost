@@ -1,8 +1,17 @@
 ## localhost too fast? try yocalhost.
 
-yocalhost is an http development server that simulates latency and bandwidth limitations. 
+yocalhost is a throttled HTTP(S) development server: it serves a directory of
+files with artificial latency and bandwidth limits. It supports Range requests,
+and HTTPS (HTTP/1.1 or HTTP/2) with a self-signed certificate.
 
-It supports Range requests, and will throttle bandwidth across all concurrent connections.
+Throttling happens at the TCP layer, not per HTTP request: every packet is
+delayed by half the round trip latency, and bandwidth is shared across all
+concurrent connections. So opening a connection costs a TCP handshake round
+trip, and HTTPS costs its TLS handshake too, like on a real network.
+
+Because it works below HTTP, yocalhost can also stand in front of any TCP
+service - your own HTTP API, a database, anything listening on a port - and
+throttle the connections to it.
 
 ### Motivation
 
@@ -33,6 +42,12 @@ yocalhost
 # Start on port 8888, simulating a 100 megabit connection with 50ms latency
 yocalhost -p 8888 -b "100Mbit" -l 50
 
+# Serve over HTTPS with a self-signed certificate (e.g. `curl -k`)
+yocalhost --https
+
+# Throttle a service you're already running on port 8080
+yocalhost --upstream 127.0.0.1:8080
+
 # See other options
 yocalhost --help
 ```
@@ -50,6 +65,8 @@ let bytes_per_second = 100_000_000 / 8;
 let web_root = "../../test/data";
 
 let server = ThrottledServer::new(port, latency_ms, bytes_per_second, web_root);
+// or ThrottledServer::new_https(...), trusting `server.certificate_pem()` in your client
+// or ThrottledServer::new_proxy(port, latency_ms, bytes_per_second, "127.0.0.1:8080")
     
 let runtime = tokio::runtime::Runtime::new().unwrap(); : Runtime    
 runtime.spawn(async move {
